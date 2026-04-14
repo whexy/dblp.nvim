@@ -29,6 +29,42 @@ local function get_first_author(hit)
     return "Unknown Author"
 end
 
+local function get_first_word(text, fallback)
+    if type(text) ~= "string" then
+        return fallback
+    end
+
+    local word = text:match("%w+")
+    if not word or word == "" then
+        return fallback
+    end
+
+    return word:lower()
+end
+
+local function get_citekey(hit)
+    local first_author = get_first_author(hit)
+    local author_part = get_first_word(first_author, "unknown")
+
+    local year = tostring((hit.info and hit.info.year) or ""):match("%d%d%d%d") or "0000"
+
+    local title = (hit.info and hit.info.title) or ""
+    local title_part = get_first_word(title, "untitled")
+
+    return string.format("%s%s%s", author_part, year, title_part)
+end
+
+local function rewrite_bibtex_key(bib_res, citekey)
+    local first_line, rest = bib_res:match("^([^\r\n]+)([\r\n].*)$")
+    if not first_line then
+        first_line = bib_res
+        rest = ""
+    end
+
+    local rewritten_first_line = first_line:gsub("^(%s*@[%w]+%s*%{)%s*([^,]+)(,.*)$", "%1" .. citekey .. "%3", 1)
+    return rewritten_first_line .. rest
+end
+
 function M.search_and_insert()
     -- Check our lock
     if is_request_ongoing then
@@ -105,8 +141,11 @@ function M.search_and_insert()
                 return
             end
 
+            local citekey = get_citekey(choice)
+            local rewritten_bib = rewrite_bibtex_key(bib_res, citekey)
+
             -- Convert binary/raw text stream into Neovim buffer lines and insert
-            local lines = vim.split(bib_res, '\r?\n')
+            local lines = vim.split(rewritten_bib, '\r?\n')
             vim.api.nvim_put(lines, 'l', true, true)
             vim.notify("BibTeX successfully inserted.", vim.log.levels.INFO)
         end)
