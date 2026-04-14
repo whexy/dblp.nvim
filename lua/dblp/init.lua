@@ -59,7 +59,7 @@ local function get_citekey(hit)
 end
 
 local function rewrite_bibtex_key(bib_res, citekey)
-    local rewritten, count = bib_res:gsub("^(%s*@[%w]+%s*%{)%s*([^,]+)", "%1" .. citekey, 1)
+    local rewritten, count = bib_res:gsub("^(%s*@[%w]+%s*%{)%s*[^,]+", "%1" .. citekey, 1)
     if count == 0 then
         return bib_res
     end
