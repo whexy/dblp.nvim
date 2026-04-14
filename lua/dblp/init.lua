@@ -47,6 +47,10 @@ local function get_citekey(hit)
     local author_part = get_first_word(first_author, "unknown")
 
     local year = tostring((hit.info and hit.info.year) or ""):match("%d%d%d%d") or "0000"
+    local year_num = tonumber(year)
+    if not year_num or year_num < 1900 or year_num > 2100 then
+        year = "0000"
+    end
 
     local title = (hit.info and hit.info.title) or ""
     local title_part = get_first_word(title, "untitled")
@@ -55,7 +59,11 @@ local function get_citekey(hit)
 end
 
 local function rewrite_bibtex_key(bib_res, citekey)
-    return bib_res:gsub("^(%s*@[%w]+%s*%{)%s*([^,]+)", "%1" .. citekey, 1)
+    local rewritten, count = bib_res:gsub("^(%s*@[%w]+%s*%{)%s*([^,]+)", "%1" .. citekey, 1)
+    if count == 0 then
+        return bib_res
+    end
+    return rewritten
 end
 
 function M.search_and_insert()
