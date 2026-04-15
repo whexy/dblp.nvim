@@ -65,10 +65,52 @@ local function rewrite_bibtex_key(bib_res, citekey)
 	return rewritten
 end
 
+-- Default request timeout in milliseconds
+local REQUEST_TIMEOUT_MS = 10000
+
+--- Makes an async HTTP GET request with timeout via vim.net.request().
+--- Requires Neovim >= 0.12.
+---@param url string
+---@param timeout_ms integer timeout in milliseconds
+---@param callback fun(err: string?, body: string?)
+local function async_get(url, timeout_ms, callback)
+	local done = false
+	local timer = nil
+
+	local job = vim.net.request(url, {}, function(err, response)
+		if done then
+			return
+		end
+		done = true
+		if timer then
+			timer:stop()
+			timer:close()
+		end
+		if err then
+			callback(err, nil)
+		else
+			callback(nil, response.body)
+		end
+	end)
+
+	-- Arm a timeout that cancels the request
+	timer = vim.uv.new_timer()
+	timer:start(timeout_ms, 0, function()
+		if done then
+			return
+		end
+		done = true
+		timer:stop()
+		timer:close()
+		job:close()
+		callback(string.format("Request timed out after %d seconds.", timeout_ms / 1000), nil)
+	end)
+end
+
 function M.search_and_insert()
 	-- Check our lock
 	if is_request_ongoing then
-		vim.api.nvim_err_writeln("DBLP Error: A search request is already in progress.")
+		vim.notify("DBLP Error: A search request is already in progress.", vim.log.levels.ERROR)
 		return
 	end
 
@@ -82,76 +124,75 @@ function M.search_and_insert()
 		local encoded_query = url_encode(query)
 		local search_url = string.format("https://dblp.org/search/publ/api?q=%s&format=json", encoded_query)
 
-		-- Execute synchronous curl with a 3-second maximum timeout (-m 3)
-		-- This blocks the Neovim event loop entirely, forcing the user to wait.
-		local res = vim.fn.system({ "curl", "-s", "-m", "3", search_url })
-		local exit_code = vim.v.shell_error
-
-		if exit_code ~= 0 then
-			is_request_ongoing = false
-			if exit_code == 28 then -- standard curl exit code for timeout
-				vim.api.nvim_err_writeln("DBLP Error: Request timed out after 3 seconds.")
-			else
-				vim.api.nvim_err_writeln(string.format("DBLP Error: curl failed with code %d.", exit_code))
-			end
-			return
-		end
-
-		local ok, parsed = pcall(vim.fn.json_decode, res)
-		if not ok or not parsed.result or not parsed.result.hits or not parsed.result.hits.hit then
-			is_request_ongoing = false
-			vim.notify("DBLP: No results found or invalid JSON.", vim.log.levels.WARN)
-			return
-		end
-
-		local hits = parsed.result.hits.hit
-
-		-- The I/O phase is done, unlock before handing control back to the UI
-		is_request_ongoing = false
-
-		-- Spawn the selection table natively
-		vim.ui.select(hits, {
-			prompt = "Select Publication:",
-			format_item = function(hit)
-				local title = hit.info.title or "Unknown Title"
-				local first_author = get_first_author(hit)
-				return string.format("[%s] %s", first_author, title)
-			end,
-		}, function(choice)
-			if not choice then
+		-- Async search request — does not block the editor
+		async_get(search_url, REQUEST_TIMEOUT_MS, function(err, body)
+			if err then
+				is_request_ongoing = false
+				vim.schedule(function()
+					vim.notify("DBLP Error: " .. err, vim.log.levels.ERROR)
+				end)
 				return
 			end
 
-			if is_request_ongoing then
-				vim.api.nvim_err_writeln("DBLP Error: A download request is already in progress.")
+			local ok, parsed = pcall(vim.json.decode, body)
+			if not ok or not parsed.result or not parsed.result.hits or not parsed.result.hits.hit then
+				is_request_ongoing = false
+				vim.schedule(function()
+					vim.notify("DBLP: No results found or invalid JSON.", vim.log.levels.WARN)
+				end)
 				return
 			end
 
-			is_request_ongoing = true
-			local bib_url = choice.info.url .. ".bib?param=1"
+			local hits = parsed.result.hits.hit
 
-			-- Synchronously fetch the BibTeX payload, also with a 3-second timeout
-			local bib_res = vim.fn.system({ "curl", "-s", "-m", "3", bib_url })
-			local bib_exit_code = vim.v.shell_error
-
+			-- The I/O phase is done, unlock before handing control back to the UI
 			is_request_ongoing = false
 
-			if bib_exit_code ~= 0 then
-				if bib_exit_code == 28 then
-					vim.api.nvim_err_writeln("DBLP Error: BibTeX download timed out after 3 seconds.")
-				else
-					vim.api.nvim_err_writeln("DBLP Error: Failed to download BibTeX content.")
-				end
-				return
-			end
+			-- Spawn the selection UI (must be on the main thread)
+			vim.schedule(function()
+				vim.ui.select(hits, {
+					prompt = "Select Publication:",
+					format_item = function(hit)
+						local title = hit.info.title or "Unknown Title"
+						local first_author = get_first_author(hit)
+						return string.format("[%s] %s", first_author, title)
+					end,
+				}, function(choice)
+					if not choice then
+						return
+					end
 
-			local citekey = get_citekey(choice)
-			local rewritten_bib = rewrite_bibtex_key(bib_res, citekey)
+					if is_request_ongoing then
+						vim.notify("DBLP Error: A download request is already in progress.", vim.log.levels.ERROR)
+						return
+					end
 
-			-- Convert binary/raw text stream into Neovim buffer lines and insert
-			local lines = vim.split(rewritten_bib, "\r?\n")
-			vim.api.nvim_put(lines, "l", true, true)
-			vim.notify("BibTeX successfully inserted.", vim.log.levels.INFO)
+					is_request_ongoing = true
+					local bib_url = choice.info.url .. ".bib?param=1"
+
+					-- Async BibTeX download — does not block the editor
+					async_get(bib_url, REQUEST_TIMEOUT_MS, function(bib_err, bib_body)
+						is_request_ongoing = false
+
+						if bib_err then
+							vim.schedule(function()
+								vim.notify("DBLP Error: " .. bib_err, vim.log.levels.ERROR)
+							end)
+							return
+						end
+
+						local citekey = get_citekey(choice)
+						local rewritten_bib = rewrite_bibtex_key(bib_body, citekey)
+
+						-- Insert into buffer (must be on the main thread)
+						vim.schedule(function()
+							local lines = vim.split(rewritten_bib, "\r?\n")
+							vim.api.nvim_put(lines, "l", true, true)
+							vim.notify("BibTeX successfully inserted.", vim.log.levels.INFO)
+						end)
+					end)
+				end)
+			end)
 		end)
 	end)
 end
